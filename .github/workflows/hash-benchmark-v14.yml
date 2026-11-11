@@ -1,3 +1,4 @@
+
 name: SHA v1.4 Benchmark
 
 on:
@@ -30,7 +31,9 @@ jobs:
 
       - name: Run detailed benchmark
         run: |
-          node --expose-gc <<'NODE'
+          node --input-type=commonjs --expose-gc <<'NODE'
+          (async () => {
+
           const { performance } = require("node:perf_hooks");
           const { webcrypto } = require("node:crypto");
           const CryptoJS = require("crypto-js");
@@ -483,4 +486,9 @@ jobs:
           log(`Correctness: ${passed}/${passed + failed}`);
           log(`Performance cases: ${allResults.length}`);
           log("==================================================");
+
+          })().catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+          });
           NODE
