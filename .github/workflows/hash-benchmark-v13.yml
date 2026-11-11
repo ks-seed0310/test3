@@ -1,0 +1,402 @@
+
+name: SHA v1.3 Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "hashalgo_v1.3.js"
+      - ".github/workflows/hash-benchmark-v13.yml"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install CryptoJS
+        run: npm install crypto-js@4.2.0
+
+      - name: Export ShaAlgo
+        run: |
+          printf '\nmodule.exports = { ShaAlgo };\n' >> hashalgo_v1.3.js
+
+      - name: Run detailed benchmark
+        run: |
+          node --expose-gc <<'NODE'
+          const { performance } = require("node:perf_hooks");
+          const CryptoJS = require("crypto-js");
+          const { ShaAlgo } = require("./hashalgo_v1.3.js");
+
+          const own = new ShaAlgo();
+
+          const algorithms = [
+            {
+              name: "SHA-1",
+              own: data => own.sha1_160(data),
+              crypto: data => CryptoJS.SHA1(data)
+            },
+            {
+              name: "SHA-256",
+              own: data => own.sha2_256(data),
+              crypto: data => CryptoJS.SHA256(data)
+            },
+            {
+              name: "SHA-384",
+              own: data => own.sha2_384(data),
+              crypto: data => CryptoJS.SHA384(data)
+            },
+            {
+              name: "SHA-512",
+              own: data => own.sha2_512(data),
+              crypto: data => CryptoJS.SHA512(data)
+            }
+          ];
+
+          const sizes = [
+            16,
+            64,
+            256,
+            1024,
+            4096,
+            16384,
+            65536,
+            262144,
+            1048576,
+            4194304,
+            16777216,
+            67108864
+          ];
+
+          // サイズ別の実行回数
+          const iterations = {
+            16: 10000,
+            64: 8000,
+            256: 5000,
+            1024: 2500,
+            4096: 1200,
+            16384: 500,
+            65536: 150,
+            262144: 40,
+            1048576: 10,
+            4194304: 4,
+            16777216: 2,
+            67108864: 1
+          };
+
+          const REPEATS = 3;
+
+          function hexOwn(result) {
+            return Buffer.from(result).toString("hex");
+          }
+
+          function hexCrypto(result) {
+            return result.toString(CryptoJS.enc.Hex);
+          }
+
+          function makeData(size, pattern) {
+            const data = new Uint8Array(size);
+
+            if (pattern === "zero") {
+              data.fill(0);
+            } else if (pattern === "ff") {
+              data.fill(255);
+            } else if (pattern === "sequence") {
+              for (let i = 0; i < size; i++) {
+                data[i] = i & 255;
+              }
+            } else if (pattern === "alternating") {
+              for (let i = 0; i < size; i++) {
+                data[i] = i & 1 ? 0xAA : 0x55;
+              }
+            }
+
+            return data;
+          }
+
+          // CryptoJS用WordArrayを計測前に作成
+          function toWordArray(data) {
+            const words = new Array(Math.ceil(data.length / 4));
+
+            for (let i = 0; i < data.length; i++) {
+              words[i >>> 2] =
+                (words[i >>> 2] || 0) |
+                (data[i] << (24 - (i % 4) * 8));
+            }
+
+            return CryptoJS.lib.WordArray.create(words, data.length);
+          }
+
+          function median(values) {
+            const sorted = [...values].sort((a, b) => a - b);
+            return sorted[Math.floor(sorted.length / 2)];
+          }
+
+          function formatMs(ms) {
+            return ms.toFixed(3) + " ms";
+          }
+
+          function formatRate(bytes, ms) {
+            return (bytes / 1024 / 1024 / (ms / 1000)).toFixed(2);
+          }
+
+          function log(message = "") {
+            console.log(message);
+          }
+
+          log("==================================================");
+          log(" SHA v1.3 / CryptoJS 4.2.0 Benchmark");
+          log("==================================================");
+          log(`Node       : ${process.version}`);
+          log(`Platform   : ${process.platform} ${process.arch}`);
+          log(`CryptoJS   : 4.2.0`);
+          log(`Repeats    : ${REPEATS}`);
+          log(`Algorithms : ${algorithms.length}`);
+          log(`Sizes      : ${sizes.length}`);
+          log(`GC         : ${typeof global.gc === "function" ? "enabled" : "disabled"}`);
+          log("==================================================");
+          log("");
+
+          // --------------------------------------------------
+          // 正当性テスト
+          // --------------------------------------------------
+
+          log("################ CORRECTNESS TEST ################");
+          log("");
+
+          let passed = 0;
+          let failed = 0;
+
+          for (const size of sizes) {
+            let patterns;
+
+            if (size <= 1048576) {
+              patterns = ["zero", "ff", "sequence", "alternating"];
+            } else if (size <= 16777216) {
+              patterns = ["zero", "sequence"];
+            } else {
+              patterns = ["zero"];
+            }
+
+            log(`--- Size: ${size.toLocaleString()} bytes ---`);
+            log(`Patterns: ${patterns.join(", ")}`);
+
+            for (const pattern of patterns) {
+              const data = makeData(size, pattern);
+              const wordArray = toWordArray(data);
+
+              for (const alg of algorithms) {
+                const ownResult = hexOwn(alg.own(data));
+                const cryptoResult = hexCrypto(alg.crypto(wordArray));
+
+                if (ownResult === cryptoResult) {
+                  passed++;
+                  log(`  PASS | ${alg.name.padEnd(7)} | ${pattern}`);
+                } else {
+                  failed++;
+                  log(`  FAIL | ${alg.name.padEnd(7)} | ${pattern}`);
+                  log(`    Own    : ${ownResult}`);
+                  log(`    Crypto : ${cryptoResult}`);
+                }
+              }
+
+              if (global.gc) global.gc();
+            }
+
+            log("");
+          }
+
+          log("################ CORRECTNESS SUMMARY ################");
+          log(`Passed : ${passed}`);
+          log(`Failed : ${failed}`);
+          log(`Total  : ${passed + failed}`);
+          log("");
+
+          if (failed > 0) {
+            throw new Error("Correctness test failed.");
+          }
+
+          // --------------------------------------------------
+          // ベンチマーク
+          // --------------------------------------------------
+
+          log("################ PERFORMANCE TEST ################");
+          log("Speedup = CryptoJS time / Own time");
+          log("Speedup > 1.0 means Own is faster.");
+          log("");
+
+          const allResults = [];
+
+          for (const size of sizes) {
+            const count = iterations[size];
+            const data = makeData(size, "sequence");
+            const wordArray = toWordArray(data);
+
+            log("==================================================");
+            log(`SIZE: ${size.toLocaleString()} bytes`);
+            log(`Iterations per repeat: ${count.toLocaleString()}`);
+            log(`Repeats: ${REPEATS}`);
+            log(`Total hashes per implementation: ${(count * REPEATS).toLocaleString()}`);
+            log("==================================================");
+
+            for (const alg of algorithms) {
+              log("");
+              log(`>>> ${alg.name}`);
+
+              // ウォームアップ
+              alg.own(data);
+              alg.own(data);
+              alg.crypto(wordArray);
+              alg.crypto(wordArray);
+
+              const ownTimes = [];
+              const cryptoTimes = [];
+
+              for (let r = 0; r < REPEATS; r++) {
+                let ownTime;
+                let cryptoTime;
+
+                if (global.gc) global.gc();
+
+                // 測定順を交互にする
+                if (r % 2 === 0) {
+                  let start = performance.now();
+                  for (let i = 0; i < count; i++) {
+                    alg.own(data);
+                  }
+                  ownTime = performance.now() - start;
+
+                  if (global.gc) global.gc();
+
+                  start = performance.now();
+                  for (let i = 0; i < count; i++) {
+                    alg.crypto(wordArray);
+                  }
+                  cryptoTime = performance.now() - start;
+                } else {
+                  let start = performance.now();
+                  for (let i = 0; i < count; i++) {
+                    alg.crypto(wordArray);
+                  }
+                  cryptoTime = performance.now() - start;
+
+                  if (global.gc) global.gc();
+
+                  start = performance.now();
+                  for (let i = 0; i < count; i++) {
+                    alg.own(data);
+                  }
+                  ownTime = performance.now() - start;
+                }
+
+                ownTimes.push(ownTime);
+                cryptoTimes.push(cryptoTime);
+
+                log(
+                  `  Repeat ${r + 1}/${REPEATS}` +
+                  ` | Own: ${formatMs(ownTime)}` +
+                  ` | CryptoJS: ${formatMs(cryptoTime)}`
+                );
+              }
+
+              const ownMedian = median(ownTimes);
+              const cryptoMedian = median(cryptoTimes);
+              const speedup = cryptoMedian / ownMedian;
+
+              const totalBytes = size * count;
+
+              const result = {
+                algorithm: alg.name,
+                size,
+                count,
+                ownMedian,
+                cryptoMedian,
+                speedup,
+                ownMin: Math.min(...ownTimes),
+                ownMax: Math.max(...ownTimes),
+                cryptoMin: Math.min(...cryptoTimes),
+                cryptoMax: Math.max(...cryptoTimes)
+              };
+
+              allResults.push(result);
+
+              log("");
+              log(`  [${alg.name} SUMMARY]`);
+              log(`  Own median      : ${formatMs(ownMedian)}`);
+              log(`  Own min         : ${formatMs(result.ownMin)}`);
+              log(`  Own max         : ${formatMs(result.ownMax)}`);
+              log(`  CryptoJS median : ${formatMs(cryptoMedian)}`);
+              log(`  CryptoJS min    : ${formatMs(result.cryptoMin)}`);
+              log(`  CryptoJS max    : ${formatMs(result.cryptoMax)}`);
+              log(`  Own hashes/sec  : ${(count / (ownMedian / 1000)).toFixed(2)}`);
+              log(`  Crypto hashes/s : ${(count / (cryptoMedian / 1000)).toFixed(2)}`);
+              log(`  Own MB/s        : ${formatRate(totalBytes, ownMedian)}`);
+              log(`  CryptoJS MB/s   : ${formatRate(totalBytes, cryptoMedian)}`);
+              log(`  Speedup         : ${speedup.toFixed(3)}x`);
+              log(`  Result          : ${speedup >= 1 ? "OWN FASTER" : "CRYPTOJS FASTER"}`);
+
+              if (global.gc) global.gc();
+            }
+
+            log("");
+          }
+
+          // --------------------------------------------------
+          // 総合結果
+          // --------------------------------------------------
+
+          log("");
+          log("################ FINAL RESULT TABLE ################");
+          log("");
+
+          log(
+            "Algorithm".padEnd(12) +
+            "Size".padStart(14) +
+            "Own(ms)".padStart(14) +
+            "Crypto(ms)".padStart(14) +
+            "Speedup".padStart(12) +
+            "Winner".padStart(16)
+          );
+
+          log("-".repeat(82));
+
+          for (const r of allResults) {
+            log(
+              r.algorithm.padEnd(12) +
+              r.size.toLocaleString().padStart(14) +
+              r.ownMedian.toFixed(3).padStart(14) +
+              r.cryptoMedian.toFixed(3).padStart(14) +
+              (r.speedup.toFixed(3) + "x").padStart(12) +
+              (r.speedup >= 1 ? "OWN" : "CryptoJS").padStart(16)
+            );
+          }
+
+          log("");
+          log("################ ALGORITHM SUMMARY ################");
+
+          for (const alg of algorithms) {
+            const rows = allResults.filter(r => r.algorithm === alg.name);
+            const wins = rows.filter(r => r.speedup >= 1).length;
+            const average = rows.reduce((s, r) => s + r.speedup, 0) / rows.length;
+
+            log(
+              `${alg.name.padEnd(8)} | ` +
+              `Wins: ${wins}/${rows.length} | ` +
+              `Average speedup: ${average.toFixed(3)}x`
+            );
+          }
+
+          log("");
+          log("################ BENCHMARK COMPLETE ################");
+          log(`Correctness: ${passed}/${passed + failed}`);
+          log(`Performance cases: ${allResults.length}`);
+          log("==================================================");
+          NODE
