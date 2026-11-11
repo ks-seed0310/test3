@@ -29,7 +29,7 @@ jobs:
             const CryptoJS = require("crypto-js");
 
             // 1. ./hashalgo_v1.js を読み込んでクラスを取得 (exportが無くても動くようにVMで評価)
-            let code = fs.readFileSync("./hashalgo_v1.js", "utf8");
+            let code = fs.readFileSync("./hashalgo_v1.1.js", "utf8");
             code += "\n;globalThis.ShaAlgo = ShaAlgo;";
             vm.runInThisContext(code);
 
