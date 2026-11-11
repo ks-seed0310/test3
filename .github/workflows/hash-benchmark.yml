@@ -1,5 +1,4 @@
-
-name: HashAlgo v1.1 vs CryptoJS
+name: SHA Algorithm Benchmark
 
 on:
   workflow_dispatch:
@@ -8,253 +7,766 @@ on:
       - "hashalgo_v1.1.js"
       - ".github/workflows/hash-benchmark.yml"
 
+permissions:
+  contents: read
+
 jobs:
   benchmark:
+    name: SHA-1 / SHA-256 / SHA-384 / SHA-512
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
+      # ==========================================
+      # 1. 環境構築
+      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "22"
 
       - name: Install CryptoJS
-        run: npm install --no-save crypto-js@4.2.0
-
-      - name: Prepare module export
-        shell: bash
         run: |
-          test -f ./hashalgo_v1.1.js
-          printf '\nif (typeof module !== "undefined") module.exports = { ShaAlgo };\n' >> ./hashalgo_v1.1.js
+          npm init -y
+          npm install crypto-js@4.2.0
 
-      - name: Run tests and benchmark
-        shell: bash
+      - name: Display environment information
         run: |
-          cat > benchmark.cjs <<'NODE'
+          echo "=========================================="
+          echo " Environment Information"
+          echo "=========================================="
+          node --version
+          npm --version
+          echo "OS: $(uname -a)"
+          echo "CPU:"
+          lscpu | grep -E 'Model name|Architecture|CPU\(s\)' || true
+          echo "=========================================="
+
+      # ==========================================
+      # 2. ベンチマークプログラムの作成
+      # ==========================================
+      - name: Prepare benchmark
+        run: |
+          # Actionsの実行環境内だけでCommonJS形式のexportを追加する
+          node -e '
+            const fs = require("fs");
+            const path = "./hashalgo_v1.1.js";
+            let source = fs.readFileSync(path, "utf8");
+
+            if (!source.includes("module.exports")) {
+              fs.appendFileSync(
+                path,
+                "\n\nif (typeof module !== \"undefined\") module.exports = { ShaAlgo };\n"
+              );
+            }
+          '
+
+          cat > benchmark.cjs <<'EOF'
+          "use strict";
+
+          const { performance } = require("node:perf_hooks");
           const CryptoJS = require("crypto-js");
           const { ShaAlgo } = require("./hashalgo_v1.1.js");
 
-          const algo = new ShaAlgo();
+          // ==========================================
+          // 設定
+          // ==========================================
+
+          const CONFIG = {
+            warmupMs: 200,
+            sampleMs: 1000,
+            samples: 5,
+
+            // サイズごとの計測ループ内のバッチ数
+            batchSize: {
+              64: 256,
+              1024: 64,
+              65536: 2,
+              1048576: 1
+            }
+          };
+
+          const benchmarkSizes = [
+            { name: "64 B", bytes: 64 },
+            { name: "1 KB", bytes: 1024 },
+            { name: "64 KB", bytes: 65536 },
+            { name: "1 MB", bytes: 1048576 }
+          ];
+
+          // ==========================================
+          // アルゴリズム定義
+          // ==========================================
+
+          const sha = new ShaAlgo();
 
           const algorithms = [
-            ["SHA-1", b => algo.sha1_160(b), CryptoJS.SHA1],
-            ["SHA-256", b => algo.sha2_256(b), CryptoJS.SHA256],
-            ["SHA-384", b => algo.sha2_384(b), CryptoJS.SHA384],
-            ["SHA-512", b => algo.sha2_512(b), CryptoJS.SHA512]
+            {
+              name: "SHA-1",
+              method: "sha1_160",
+              reference: CryptoJS.SHA1
+            },
+            {
+              name: "SHA-256",
+              method: "sha2_256",
+              reference: CryptoJS.SHA256
+            },
+            {
+              name: "SHA-384",
+              method: "sha2_384",
+              reference: CryptoJS.SHA384
+            },
+            {
+              name: "SHA-512",
+              method: "sha2_512",
+              reference: CryptoJS.SHA512
+            }
           ];
+
+          // ==========================================
+          // ダイジェストを16進数文字列に統一
+          // ==========================================
+
+          function normalizeHex(value) {
+            if (typeof value === "string") {
+              return value.toLowerCase();
+            }
+
+            if (value instanceof ArrayBuffer) {
+              value = new Uint8Array(value);
+            }
+
+            if (ArrayBuffer.isView(value)) {
+              const bytes = new Uint8Array(
+                value.buffer,
+                value.byteOffset,
+                value.byteLength
+              );
+
+              return Array.from(bytes, b =>
+                b.toString(16).padStart(2, "0")
+              ).join("");
+            }
+
+            if (Array.isArray(value)) {
+              return Array.from(value, b =>
+                (Number(b) & 255).toString(16).padStart(2, "0")
+              ).join("");
+            }
+
+            if (
+              value &&
+              Array.isArray(value.words) &&
+              Number.isInteger(value.sigBytes)
+            ) {
+              const bytes = [];
+
+              for (let i = 0; i < value.sigBytes; i++) {
+                const word = value.words[i >>> 2] || 0;
+                bytes.push(
+                  (word >>> (24 - (i % 4) * 8)) & 255
+                );
+              }
+
+              return bytes.map(b =>
+                b.toString(16).padStart(2, "0")
+              ).join("");
+            }
+
+            throw new TypeError(
+              "Unsupported digest type: " + typeof value
+            );
+          }
+
+          // ==========================================
+          // Uint8Array → CryptoJS WordArray
+          // ==========================================
 
           function toWordArray(bytes) {
             const words = [];
-            for (let i = 0; i < bytes.length; i += 4) {
-              words.push(
-                ((bytes[i] || 0) << 24) |
-                ((bytes[i + 1] || 0) << 16) |
-                ((bytes[i + 2] || 0) << 8) |
-                (bytes[i + 3] || 0)
-              );
+
+            for (let i = 0; i < bytes.length; i++) {
+              words[i >>> 2] |=
+                bytes[i] << (24 - (i % 4) * 8);
             }
-            return CryptoJS.lib.WordArray.create(words, bytes.length);
+
+            return CryptoJS.lib.WordArray.create(
+              words,
+              bytes.length
+            );
           }
 
-          function hex(buffer) {
-            return Buffer.from(buffer).toString("hex");
-          }
+          // ==========================================
+          // テストデータ生成
+          // ==========================================
 
-          function makeData(length, mode, seed = 123456789) {
+          function makeData(length, pattern) {
             const data = new Uint8Array(length);
 
-            if (mode === "zero") return data;
+            if (pattern === "zeros") {
+              return data;
+            }
 
-            if (mode === "ff") {
+            if (pattern === "ones") {
               data.fill(255);
               return data;
             }
 
-            if (mode === "sequence") {
+            if (pattern === "sequence") {
               for (let i = 0; i < length; i++) {
                 data[i] = i & 255;
               }
+
               return data;
             }
 
-            let x = seed >>> 0;
+            if (pattern === "random") {
+              let state = (0x12345678 ^ length) >>> 0;
 
-            for (let i = 0; i < length; i++) {
-              x ^= x << 13;
-              x ^= x >>> 17;
-              x ^= x << 5;
-              data[i] = x & 255;
+              for (let i = 0; i < length; i++) {
+                state ^= state << 13;
+                state ^= state >>> 17;
+                state ^= state << 5;
+                data[i] = state & 255;
+              }
+
+              return data;
             }
 
-            return data;
+            throw new Error("Unknown pattern: " + pattern);
           }
 
-          const sizes = [
-            0, 1, 2, 3, 7, 8, 15, 16,
-            31, 32, 55, 56, 57, 63, 64, 65,
-            111, 112, 113, 119, 120, 121,
-            127, 128, 129, 191, 192, 193,
-            239, 240, 241, 255, 256, 257,
-            511, 512, 513, 1023, 1024, 1025,
-            4095, 4096, 4097, 16384, 65536
+          const patterns = [
+            "zeros",
+            "ones",
+            "sequence",
+            "random"
           ];
 
-          const patterns = ["zero", "ff", "sequence", "random"];
+          // ==========================================
+          // 正当性テスト
+          // ==========================================
 
-          let total = 0;
-          let failed = 0;
+          function runCorrectnessTests() {
+            console.log("");
+            console.log("==========================================");
+            console.log(" CORRECTNESS TEST");
+            console.log("==========================================");
 
-          console.log("========================================");
-          console.log("HashAlgo v1.1 vs CryptoJS 4.2.0");
-          console.log("Node:", process.version);
-          console.log("Platform:", process.platform, process.arch);
-          console.log("========================================");
+            const sizes = [
+              0, 1, 2, 3, 7, 8, 15, 16,
+              31, 32, 55, 56, 57, 63, 64, 65,
+              111, 112, 113, 119, 120, 121,
+              127, 128, 129, 191, 192, 193,
+              239, 240, 241, 255, 256, 257,
+              511, 512, 513, 1023, 1024, 1025,
+              4095, 4096, 4097, 16384, 65536
+            ];
 
-          for (const [name, own, reference] of algorithms) {
-            console.log(`\n========== ${name} ==========`);
+            let total = 0;
+            let passed = 0;
+            let failed = 0;
 
-            for (const size of sizes) {
-              for (const pattern of patterns) {
-                const data = makeData(size, pattern, size + 12345);
+            const failures = [];
 
-                let actual;
-                let expected;
+            for (const algorithm of algorithms) {
+              console.log("");
+              console.log("------------------------------------------");
+              console.log("Algorithm: " + algorithm.name);
+              console.log("Method: " + algorithm.method);
+              console.log("------------------------------------------");
 
-                try {
-                  actual = hex(own(data));
-                  expected = reference(toWordArray(data)).toString();
-                } catch (error) {
-                  failed++;
+              let algorithmPassed = 0;
+              let algorithmFailed = 0;
+
+              for (const size of sizes) {
+                for (const pattern of patterns) {
                   total++;
 
-                  console.error(
-                    `[ERROR] size=${size} pattern=${pattern}`,
-                    error.stack || error
-                  );
+                  const data = makeData(size, pattern);
 
-                  continue;
-                }
+                  try {
+                    const ownResult = normalizeHex(
+                      sha[algorithm.method](data)
+                    );
 
-                total++;
+                    const referenceResult = normalizeHex(
+                      algorithm.reference(toWordArray(data))
+                    );
 
-                if (actual !== expected) {
-                  failed++;
+                    if (ownResult === referenceResult) {
+                      passed++;
+                      algorithmPassed++;
+                    } else {
+                      failed++;
+                      algorithmFailed++;
 
-                  console.error(
-                    `[FAIL] size=${size} pattern=${pattern}`
-                  );
-                  console.error("OWN:     ", actual);
-                  console.error("CryptoJS:", expected);
-                } else {
-                  console.log(
-                    `[PASS] size=${size} pattern=${pattern} digest=${actual.slice(0, 16)}...`
-                  );
+                      const failure = {
+                        algorithm: algorithm.name,
+                        size,
+                        pattern,
+                        own: ownResult,
+                        reference: referenceResult
+                      };
+
+                      failures.push(failure);
+
+                      console.error(
+                        "[FAIL]",
+                        algorithm.name,
+                        "size=" + size,
+                        "pattern=" + pattern
+                      );
+
+                      console.error("Own:      " + ownResult);
+                      console.error("CryptoJS: " + referenceResult);
+                    }
+                  } catch (error) {
+                    failed++;
+                    algorithmFailed++;
+
+                    failures.push({
+                      algorithm: algorithm.name,
+                      size,
+                      pattern,
+                      error: String(error)
+                    });
+
+                    console.error(
+                      "[ERROR]",
+                      algorithm.name,
+                      "size=" + size,
+                      "pattern=" + pattern
+                    );
+
+                    console.error(error.stack || error);
+                  }
                 }
               }
+
+              console.log(
+                "[RESULT]",
+                algorithm.name,
+                algorithmPassed + "/" +
+                (algorithmPassed + algorithmFailed),
+                "PASS"
+              );
             }
+
+            console.log("");
+            console.log("==========================================");
+            console.log(" CORRECTNESS SUMMARY");
+            console.log("==========================================");
+            console.log("Total:  " + total);
+            console.log("Passed: " + passed);
+            console.log("Failed: " + failed);
+            console.log(
+              "Rate:   " +
+              (total ? (passed / total * 100).toFixed(2) : "0.00") +
+              "%"
+            );
+
+            if (failures.length > 0) {
+              console.log("");
+              console.log("Failure details:");
+
+              for (const failure of failures) {
+                console.log(JSON.stringify(failure));
+              }
+            }
+
+            return failed === 0;
           }
 
-          console.log("\n========================================");
-          console.log(`Correctness: ${total - failed}/${total} PASS`);
-          console.log(`Failures: ${failed}`);
-          console.log("========================================");
+          // ==========================================
+          // 計測処理
+          // ==========================================
 
-          if (failed !== 0) {
-            process.exit(1);
+          function runForDuration(fn, targetMs, batchSize) {
+            let count = 0;
+
+            const start = performance.now();
+            let elapsed = 0;
+
+            while (elapsed < targetMs) {
+              for (let i = 0; i < batchSize; i++) {
+                fn();
+              }
+
+              count += batchSize;
+              elapsed = performance.now() - start;
+            }
+
+            return {
+              elapsedMs: elapsed,
+              iterations: count,
+              hashesPerSecond: count / (elapsed / 1000)
+            };
           }
 
           function median(values) {
             const sorted = [...values].sort((a, b) => a - b);
-            return sorted[Math.floor(sorted.length / 2)];
+            const middle = Math.floor(sorted.length / 2);
+
+            if (sorted.length % 2 === 0) {
+              return (sorted[middle - 1] + sorted[middle]) / 2;
+            }
+
+            return sorted[middle];
           }
 
-          function measure(fn, data, iterations) {
-            for (let i = 0; i < 3; i++) {
-              fn(data);
-            }
+          function formatNumber(value) {
+            return value.toLocaleString("en-US", {
+              maximumFractionDigits: 2
+            });
+          }
+
+          // ==========================================
+          // 性能テスト
+          // ==========================================
+
+          function runBenchmark() {
+            console.log("");
+            console.log("==========================================");
+            console.log(" PERFORMANCE BENCHMARK");
+            console.log("==========================================");
+
+            console.log("Warmup: " + CONFIG.warmupMs + " ms");
+            console.log("Sample: " + CONFIG.sampleMs + " ms");
+            console.log("Samples: " + CONFIG.samples);
+            console.log("Sizes: " + benchmarkSizes.length);
+            console.log("Algorithms: " + algorithms.length);
+
+            console.log(
+              "Target measurement time: " +
+              (
+                algorithms.length *
+                benchmarkSizes.length *
+                CONFIG.samples *
+                CONFIG.sampleMs / 1000
+              ).toFixed(1) +
+              " seconds (excluding warmup and overhead)"
+            );
 
             const results = [];
 
-            for (let r = 0; r < 5; r++) {
-              const start = process.hrtime.bigint();
+            for (const algorithm of algorithms) {
+              console.log("");
+              console.log("");
+              console.log("##########################################");
+              console.log(" START: " + algorithm.name);
+              console.log("##########################################");
 
-              for (let i = 0; i < iterations; i++) {
-                fn(data);
+              console.log(
+                "[INFO] Own implementation: " +
+                algorithm.method
+              );
+
+              console.log(
+                "[INFO] Reference implementation: CryptoJS"
+              );
+
+              for (const sizeInfo of benchmarkSizes) {
+                const size = sizeInfo.bytes;
+                const data = makeData(size, "random");
+
+                // CryptoJSの入力変換は計測前に実施する
+                const wordArray = toWordArray(data);
+
+                const ownFn = () =>
+                  sha[algorithm.method](data);
+
+                const cryptoFn = () =>
+                  algorithm.reference(wordArray);
+
+                const batchSize = CONFIG.batchSize[size];
+
+                console.log("");
+                console.log("------------------------------------------");
+                console.log(
+                  "Algorithm: " + algorithm.name +
+                  " | Size: " + sizeInfo.name
+                );
+                console.log("------------------------------------------");
+
+                // ウォームアップ
+                console.log("[WARMUP] Own implementation...");
+
+                const ownWarmup = runForDuration(
+                  ownFn,
+                  CONFIG.warmupMs,
+                  batchSize
+                );
+
+                console.log(
+                  "[WARMUP] Own: " +
+                  ownWarmup.iterations +
+                  " iterations, " +
+                  ownWarmup.elapsedMs.toFixed(2) +
+                  " ms"
+                );
+
+                console.log("[WARMUP] CryptoJS...");
+
+                const cryptoWarmup = runForDuration(
+                  cryptoFn,
+                  CONFIG.warmupMs,
+                  batchSize
+                );
+
+                console.log(
+                  "[WARMUP] CryptoJS: " +
+                  cryptoWarmup.iterations +
+                  " iterations, " +
+                  cryptoWarmup.elapsedMs.toFixed(2) +
+                  " ms"
+                );
+
+                const ownSpeeds = [];
+                const cryptoSpeeds = [];
+
+                // 複数回計測
+                for (
+                  let sample = 1;
+                  sample <= CONFIG.samples;
+                  sample++
+                ) {
+                  console.log("");
+                  console.log(
+                    "[SAMPLE " + sample +
+                    "/" + CONFIG.samples + "] " +
+                    algorithm.name + " / " +
+                    sizeInfo.name
+                  );
+
+                  // 実行順序を交互にすることで、
+                  // 一方だけが常に先に実行される影響を抑える
+                  let ownResult;
+                  let cryptoResult;
+
+                  if (sample % 2 === 1) {
+                    ownResult = runForDuration(
+                      ownFn,
+                      CONFIG.sampleMs,
+                      batchSize
+                    );
+
+                    cryptoResult = runForDuration(
+                      cryptoFn,
+                      CONFIG.sampleMs,
+                      batchSize
+                    );
+                  } else {
+                    cryptoResult = runForDuration(
+                      cryptoFn,
+                      CONFIG.sampleMs,
+                      batchSize
+                    );
+
+                    ownResult = runForDuration(
+                      ownFn,
+                      CONFIG.sampleMs,
+                      batchSize
+                    );
+                  }
+
+                  ownSpeeds.push(ownResult.hashesPerSecond);
+                  cryptoSpeeds.push(cryptoResult.hashesPerSecond);
+
+                  console.log(
+                    "  Own:      " +
+                    ownResult.iterations +
+                    " hashes / " +
+                    ownResult.elapsedMs.toFixed(2) +
+                    " ms / " +
+                    formatNumber(ownResult.hashesPerSecond) +
+                    " hashes/s"
+                  );
+
+                  console.log(
+                    "  CryptoJS: " +
+                    cryptoResult.iterations +
+                    " hashes / " +
+                    cryptoResult.elapsedMs.toFixed(2) +
+                    " ms / " +
+                    formatNumber(cryptoResult.hashesPerSecond) +
+                    " hashes/s"
+                  );
+
+                  console.log(
+                    "  Current ratio: " +
+                    (
+                      ownResult.hashesPerSecond /
+                      cryptoResult.hashesPerSecond
+                    ).toFixed(3) +
+                    "x"
+                  );
+                }
+
+                const ownMedian = median(ownSpeeds);
+                const cryptoMedian = median(cryptoSpeeds);
+                const ratio = ownMedian / cryptoMedian;
+
+                const result = {
+                  algorithm: algorithm.name,
+                  size: sizeInfo.name,
+                  own: ownMedian,
+                  crypto: cryptoMedian,
+                  ratio
+                };
+
+                results.push(result);
+
+                console.log("");
+                console.log("[MEDIAN RESULT]");
+                console.log(
+                  "  Own:      " +
+                  formatNumber(ownMedian) +
+                  " hashes/s"
+                );
+                console.log(
+                  "  CryptoJS: " +
+                  formatNumber(cryptoMedian) +
+                  " hashes/s"
+                );
+                console.log(
+                  "  Ratio:    " +
+                  ratio.toFixed(3) +
+                  "x"
+                );
+
+                if (ratio < 1) {
+                  console.log(
+                    "  Result: Own implementation is slower."
+                  );
+                } else if (ratio > 1) {
+                  console.log(
+                    "  Result: Own implementation is faster."
+                  );
+                } else {
+                  console.log("  Result: Equal speed.");
+                }
               }
 
-              const end = process.hrtime.bigint();
-
-              results.push(Number(end - start) / 1e9);
+              console.log("");
+              console.log("##########################################");
+              console.log(" END: " + algorithm.name);
+              console.log("##########################################");
             }
 
-            return median(results);
-          }
+            // ==========================================
+            // 全体結果
+            // ==========================================
 
-          const benchmarks = [
-            [64, 300],
-            [1024, 100],
-            [65536, 5],
-            [1048576, 1]
-          ];
+            console.log("");
+            console.log("");
+            console.log("==========================================");
+            console.log(" FINAL PERFORMANCE SUMMARY");
+            console.log("==========================================");
 
-          console.log("\n\n========================================");
-          console.log("PERFORMANCE BENCHMARK");
-          console.log("Median of 5 measurements");
-          console.log("========================================");
+            console.log(
+              "Ratio = Own hashes/s / CryptoJS hashes/s"
+            );
 
-          for (const [name, own, reference] of algorithms) {
-            console.log(`\n========== ${name} ==========`);
+            console.log(
+              "Ratio > 1: Own is faster"
+            );
 
-            for (const [size, iterations] of benchmarks) {
-              const data = makeData(size, "random");
+            console.log(
+              "Ratio < 1: CryptoJS is faster"
+            );
 
-              const ownTime = measure(
-                own,
-                data,
-                iterations
-              );
+            console.log("");
 
-              const cryptoTime = measure(
-                b => reference(toWordArray(b)),
-                data,
-                iterations
-              );
+            console.log(
+              "Algorithm".padEnd(12) +
+              "Size".padEnd(12) +
+              "Own hashes/s".padStart(18) +
+              "CryptoJS hashes/s".padStart(22) +
+              "Ratio".padStart(12)
+            );
 
+            console.log("-".repeat(76));
+
+            for (const result of results) {
               console.log(
-                `Input: ${size} bytes`
-              );
-
-              console.log(
-                `Iterations: ${iterations}`
-              );
-
-              console.log(
-                `Own: ${ownTime.toFixed(6)} sec`
-              );
-
-              console.log(
-                `CryptoJS: ${cryptoTime.toFixed(6)} sec`
-              );
-
-              console.log(
-                `Own speed: ${(iterations / ownTime).toFixed(2)} hashes/sec`
-              );
-
-              console.log(
-                `CryptoJS speed: ${(iterations / cryptoTime).toFixed(2)} hashes/sec`
-              );
-
-              console.log(
-                `Ratio (Own/CryptoJS): ${(ownTime / cryptoTime).toFixed(3)}x`
+                result.algorithm.padEnd(12) +
+                result.size.padEnd(12) +
+                formatNumber(result.own).padStart(18) +
+                formatNumber(result.crypto).padStart(22) +
+                (result.ratio.toFixed(3) + "x").padStart(12)
               );
             }
+
+            console.log("");
+            console.log("Total benchmark cases: " + results.length);
+            console.log("Expected cases: " +
+              (algorithms.length * benchmarkSizes.length)
+            );
+
+            console.log("");
+            console.log("==========================================");
+            console.log(" PERFORMANCE BENCHMARK COMPLETED");
+            console.log("==========================================");
+
+            return results.length ===
+              algorithms.length * benchmarkSizes.length;
           }
 
-          console.log("\nBenchmark completed.");
-          NODE
+          // ==========================================
+          // メイン処理
+          // ==========================================
 
-          node benchmark.cjs
+          console.log("");
+          console.log("==========================================");
+          console.log(" SHA ALGORITHM TEST SUITE");
+          console.log("==========================================");
+
+          console.log("Node.js: " + process.version);
+          console.log("CryptoJS: " + require("crypto-js/package.json").version);
+          console.log("Started: " + new Date().toISOString());
+
+          console.log("");
+          console.log("Algorithms:");
+          for (const algorithm of algorithms) {
+            console.log(
+              " - " + algorithm.name +
+              " (" + algorithm.method + ")"
+            );
+          }
+
+          const correctnessPassed = runCorrectnessTests();
+          const benchmarkCompleted = runBenchmark();
+
+          console.log("");
+          console.log("==========================================");
+          console.log(" FINAL TEST STATUS");
+          console.log("==========================================");
+
+          console.log(
+            "Correctness: " +
+            (correctnessPassed ? "PASS" : "FAIL")
+          );
+
+          console.log(
+            "Benchmark: " +
+            (benchmarkCompleted ? "PASS" : "FAIL")
+          );
+
+          console.log(
+            "Finished: " + new Date().toISOString()
+          );
+
+          if (!correctnessPassed || !benchmarkCompleted) {
+            process.exitCode = 1;
+          }
+
+          EOF
+
+      # ==========================================
+      # 3. 実行
+      # ==========================================
+      - name: Run SHA correctness and performance tests
+        run: node benchmark.cjs
