@@ -1,0 +1,573 @@
+
+name: SHA v1.4 / CryptoJS / WebCrypto Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "hashalgo_v1.4.js"
+      - ".github/workflows/sha-benchmark.yml"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install CryptoJS
+        run: npm install crypto-js@4.2.0
+
+      - name: Run benchmark
+        run: |
+          cat > benchmark.cjs <<'EOF'
+          const fs = require("node:fs");
+          const vm = require("node:vm");
+          const crypto = require("node:crypto");
+          const { performance } = require("node:perf_hooks");
+          const CryptoJS = require("crypto-js");
+
+          // ==========================================
+          // Load own SHA implementation
+          // ==========================================
+
+          const source = fs.readFileSync(
+              "./hashalgo_v1.4.js",
+              "utf8"
+          );
+
+          vm.runInThisContext(
+              source + "\n;globalThis.__ShaAlgo = ShaAlgo;",
+              { filename: "hashalgo_v1.4.js" }
+          );
+
+          const own = new globalThis.__ShaAlgo();
+          const subtle = crypto.webcrypto.subtle;
+
+          // ==========================================
+          // Configuration
+          // ==========================================
+
+          const algorithms = [
+              {
+                  name: "SHA-1",
+                  own: "sha1_160",
+                  cryptojs: "SHA1"
+              },
+              {
+                  name: "SHA-256",
+                  own: "sha2_256",
+                  cryptojs: "SHA256"
+              },
+              {
+                  name: "SHA-384",
+                  own: "sha2_384",
+                  cryptojs: "SHA384"
+              },
+              {
+                  name: "SHA-512",
+                  own: "sha2_512",
+                  cryptojs: "SHA512"
+              }
+          ];
+
+          const sizes = [
+              16,
+              64,
+              256,
+              1024,
+              4096,
+              16384,
+              65536,
+              262144,
+              1048576,
+              4194304,
+              16777216,
+              67108864
+          ];
+
+          const patterns = [
+              "zero",
+              "ff",
+              "sequence",
+              "alternating"
+          ];
+
+          const repeats = 3;
+
+          // ==========================================
+          // Utility
+          // ==========================================
+
+          function formatSize(bytes) {
+              if (bytes < 1024) return `${bytes} B`;
+              if (bytes < 1024 * 1024) {
+                  return `${bytes / 1024} KB`;
+              }
+              return `${bytes / 1024 / 1024} MB`;
+          }
+
+          function formatTime(ms) {
+              if (ms < 1) {
+                  return `${(ms * 1000).toFixed(2)} us`;
+              }
+              return `${ms.toFixed(3)} ms`;
+          }
+
+          function formatRate(bytes, ms) {
+              const mib = bytes / (1024 * 1024);
+              const seconds = ms / 1000;
+              return `${(mib / seconds).toFixed(2)} MiB/s`;
+          }
+
+          function median(values) {
+              const sorted = [...values].sort((a, b) => a - b);
+              return sorted[Math.floor(sorted.length / 2)];
+          }
+
+          function gc() {
+              if (global.gc) global.gc();
+          }
+
+          // ==========================================
+          // Input generation
+          // ==========================================
+
+          function makeData(size, pattern) {
+              const data = new Uint8Array(size);
+
+              switch (pattern) {
+                  case "zero":
+                      break;
+
+                  case "ff":
+                      data.fill(0xff);
+                      break;
+
+                  case "sequence":
+                      for (let i = 0; i < size; i++) {
+                          data[i] = i & 0xff;
+                      }
+                      break;
+
+                  case "alternating":
+                      for (let i = 0; i < size; i++) {
+                          data[i] = (i & 1) ? 0xaa : 0x55;
+                      }
+                      break;
+              }
+
+              return data;
+          }
+
+          // ==========================================
+          // CryptoJS conversion
+          // ==========================================
+
+          function toWordArray(data) {
+              const words = [];
+
+              for (let i = 0; i < data.length; i += 4) {
+                  words.push(
+                      (
+                          (data[i] << 24) |
+                          ((data[i + 1] || 0) << 16) |
+                          ((data[i + 2] || 0) << 8) |
+                          (data[i + 3] || 0)
+                      ) | 0
+                  );
+              }
+
+              return CryptoJS.lib.WordArray.create(
+                  words,
+                  data.length
+              );
+          }
+
+          // ==========================================
+          // Hash functions
+          // ==========================================
+
+          function ownHash(algorithm, data) {
+              return Buffer.from(
+                  own[algorithm.own](data)
+              ).toString("hex");
+          }
+
+          function cryptoJSHash(algorithm, wordArray) {
+              return CryptoJS[algorithm.cryptojs](wordArray)
+                  .toString(CryptoJS.enc.Hex);
+          }
+
+          async function webCryptoHash(algorithm, data) {
+              const result = await subtle.digest(
+                  algorithm.name,
+                  data
+              );
+
+              return Buffer.from(result).toString("hex");
+          }
+
+          // ==========================================
+          // Correctness test
+          // ==========================================
+
+          async function correctnessTest() {
+              console.log("");
+              console.log("################ CORRECTNESS TEST ################");
+
+              let total = 0;
+              let failed = 0;
+
+              for (const size of sizes) {
+                  let selectedPatterns;
+
+                  if (size <= 1048576) {
+                      selectedPatterns = patterns;
+                  } else if (size <= 16777216) {
+                      selectedPatterns = ["zero", "sequence"];
+                  } else {
+                      selectedPatterns = ["zero"];
+                  }
+
+                  for (const pattern of selectedPatterns) {
+                      const data = makeData(size, pattern);
+                      const wordArray = toWordArray(data);
+
+                      for (const algorithm of algorithms) {
+                          const ownResult = ownHash(
+                              algorithm,
+                              data
+                          );
+
+                          const cryptoResult = cryptoJSHash(
+                              algorithm,
+                              wordArray
+                          );
+
+                          const webResult = await webCryptoHash(
+                              algorithm,
+                              data
+                          );
+
+                          const checks = [
+                              ownResult === cryptoResult,
+                              cryptoResult === webResult,
+                              ownResult === webResult
+                          ];
+
+                          total += 3;
+
+                          if (checks.every(Boolean)) {
+                              console.log(
+                                  `[PASS] ${algorithm.name.padEnd(7)} ` +
+                                  `${formatSize(size).padEnd(8)} ` +
+                                  `${pattern}`
+                              );
+                          } else {
+                              failed += checks.filter(
+                                  value => !value
+                              ).length;
+
+                              console.log(
+                                  `[FAIL] ${algorithm.name} ` +
+                                  `${formatSize(size)} ${pattern}`
+                              );
+
+                              console.log(
+                                  "  Own     :", ownResult
+                              );
+                              console.log(
+                                  "  CryptoJS:", cryptoResult
+                              );
+                              console.log(
+                                  "  WebCrypto:", webResult
+                              );
+                          }
+                      }
+                  }
+
+                  gc();
+              }
+
+              console.log("----------------------------------------------");
+              console.log(`Checks : ${total}`);
+              console.log(`Failed : ${failed}`);
+              console.log(
+                  `Result : ${failed === 0 ? "ALL PASS" : "FAILED"}`
+              );
+
+              return failed === 0;
+          }
+
+          // ==========================================
+          // Performance measurement
+          // ==========================================
+
+          function getIterations(size) {
+              if (size <= 256) return 1000;
+              if (size <= 4096) return 300;
+              if (size <= 65536) return 50;
+              if (size <= 1048576) return 10;
+              if (size <= 16777216) return 2;
+              return 1;
+          }
+
+          function measureSync(fn, iterations) {
+              const start = performance.now();
+
+              for (let i = 0; i < iterations; i++) {
+                  fn();
+              }
+
+              return (performance.now() - start) / iterations;
+          }
+
+          async function measureAsync(fn, iterations) {
+              const start = performance.now();
+
+              for (let i = 0; i < iterations; i++) {
+                  await fn();
+              }
+
+              return (performance.now() - start) / iterations;
+          }
+
+          async function performanceTest() {
+              console.log("");
+              console.log("################ PERFORMANCE TEST ################");
+
+              const results = {};
+
+              for (const algorithm of algorithms) {
+                  results[algorithm.name] = {};
+              }
+
+              for (const size of sizes) {
+                  const data = makeData(size, "sequence");
+                  const wordArray = toWordArray(data);
+                  const iterations = getIterations(size);
+
+                  for (const algorithm of algorithms) {
+                      const measurements = {
+                          Own: [],
+                          CryptoJS: [],
+                          WebCrypto: []
+                      };
+
+                      for (let r = 0; r < repeats; r++) {
+                          // Rotate execution order to reduce order bias.
+                          const methods = [
+                              {
+                                  name: "Own",
+                                  run: () => ownHash(
+                                      algorithm,
+                                      data
+                                  )
+                              },
+                              {
+                                  name: "CryptoJS",
+                                  run: () => cryptoJSHash(
+                                      algorithm,
+                                      wordArray
+                                  )
+                              },
+                              {
+                                  name: "WebCrypto",
+                                  run: () => webCryptoHash(
+                                      algorithm,
+                                      data
+                                  )
+                              }
+                          ];
+
+                          const offset = r % 3;
+                          const ordered = [
+                              ...methods.slice(offset),
+                              ...methods.slice(0, offset)
+                          ];
+
+                          gc();
+
+                          for (const method of ordered) {
+                              let elapsed;
+
+                              if (method.name === "WebCrypto") {
+                                  elapsed = await measureAsync(
+                                      method.run,
+                                      iterations
+                                  );
+                              } else {
+                                  elapsed = measureSync(
+                                      method.run,
+                                      iterations
+                                  );
+                              }
+
+                              measurements[method.name].push(
+                                  elapsed
+                              );
+                          }
+                      }
+
+                      const ownMs = median(measurements.Own);
+                      const cryptoMs = median(measurements.CryptoJS);
+                      const webMs = median(measurements.WebCrypto);
+
+                      results[algorithm.name][size] = {
+                          ownMs,
+                          cryptoMs,
+                          webMs,
+                          ownRate: formatRate(size, ownMs),
+                          cryptoRate: formatRate(size, cryptoMs),
+                          webRate: formatRate(size, webMs),
+                          ownVsCrypto: cryptoMs / ownMs,
+                          ownVsWeb: webMs / ownMs
+                      };
+
+                      gc();
+                  }
+
+                  console.log(
+                      `[DONE] ${formatSize(size)}`
+                  );
+              }
+
+              // ======================================
+              // Result table
+              // ======================================
+
+              console.log("");
+              console.log("################ RESULT TABLE ################");
+
+              for (const algorithm of algorithms) {
+                  console.log("");
+                  console.log(`--- ${algorithm.name} ---`);
+
+                  console.log(
+                      "Size       | Own ms     | CryptoJS ms | WebCrypto ms | " +
+                      "Own/CryptoJS | Own/WebCrypto"
+                  );
+
+                  console.log("-".repeat(95));
+
+                  for (const size of sizes) {
+                      const r = results[algorithm.name][size];
+
+                      console.log(
+                          `${formatSize(size).padEnd(10)} | ` +
+                          `${r.ownMs.toFixed(3).padStart(10)} | ` +
+                          `${r.cryptoMs.toFixed(3).padStart(11)} | ` +
+                          `${r.webMs.toFixed(3).padStart(12)} | ` +
+                          `${r.ownVsCrypto.toFixed(3).padStart(12)}x | ` +
+                          `${r.ownVsWeb.toFixed(3).padStart(13)}x`
+                      );
+                  }
+              }
+
+              // ======================================
+              // Throughput table
+              // ======================================
+
+              console.log("");
+              console.log("################ THROUGHPUT ################");
+
+              for (const algorithm of algorithms) {
+                  console.log("");
+                  console.log(`--- ${algorithm.name} ---`);
+
+                  for (const size of sizes) {
+                      const r = results[algorithm.name][size];
+
+                      console.log(
+                          `${formatSize(size).padEnd(10)} ` +
+                          `Own=${r.ownRate.padEnd(13)} ` +
+                          `CryptoJS=${r.cryptoRate.padEnd(13)} ` +
+                          `WebCrypto=${r.webRate}`
+                      );
+                  }
+              }
+
+              // ======================================
+              // Average speedup
+              // ======================================
+
+              console.log("");
+              console.log("################ AVERAGE SPEEDUP ################");
+
+              for (const algorithm of algorithms) {
+                  const rows = sizes.map(
+                      size => results[algorithm.name][size]
+                  );
+
+                  const avgCrypto = rows.reduce(
+                      (sum, r) => sum + r.ownVsCrypto,
+                      0
+                  ) / rows.length;
+
+                  const avgWeb = rows.reduce(
+                      (sum, r) => sum + r.ownVsWeb,
+                      0
+                  ) / rows.length;
+
+                  console.log(
+                      `${algorithm.name.padEnd(7)} ` +
+                      `vs CryptoJS: ${avgCrypto.toFixed(3)}x ` +
+                      `vs WebCrypto: ${avgWeb.toFixed(3)}x`
+                  );
+              }
+
+              console.log("");
+              console.log(
+                  "Speedup > 1.000x means Own is faster."
+              );
+          }
+
+          // ==========================================
+          // Main
+          // ==========================================
+
+          async function main() {
+              console.log("==================================================");
+              console.log(" SHA v1.4 / CryptoJS 4.2.0 / WebCrypto Benchmark");
+              console.log("==================================================");
+              console.log("Node       :", process.version);
+              console.log("Platform   :", process.platform, process.arch);
+              console.log("CryptoJS   :", require("crypto-js/package.json").version);
+              console.log("Repeats    :", repeats);
+              console.log("Algorithms :", algorithms.length);
+              console.log("Sizes      :", sizes.length);
+              console.log("GC         :", typeof global.gc === "function" ? "enabled" : "disabled");
+              console.log("==================================================");
+
+              const correct = await correctnessTest();
+
+              if (!correct) {
+                  console.error(
+                      "\nCorrectness test failed. Performance test aborted."
+                  );
+                  process.exitCode = 1;
+                  return;
+              }
+
+              await performanceTest();
+
+              console.log("");
+              console.log("==================================================");
+              console.log(" Benchmark completed.");
+              console.log("==================================================");
+          }
+
+          main().catch(error => {
+              console.error(error);
+              process.exitCode = 1;
+          });
+          EOF
+
+          node --expose-gc benchmark.cjs
