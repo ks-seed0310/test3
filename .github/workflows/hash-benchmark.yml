@@ -1,0 +1,260 @@
+
+name: HashAlgo v1.1 vs CryptoJS
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "hashalgo_v1.1.js"
+      - ".github/workflows/hash-benchmark.yml"
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install CryptoJS
+        run: npm install --no-save crypto-js@4.2.0
+
+      - name: Prepare module export
+        shell: bash
+        run: |
+          test -f ./hashalgo_v1.1.js
+          printf '\nif (typeof module !== "undefined") module.exports = { ShaAlgo };\n' >> ./hashalgo_v1.1.js
+
+      - name: Run tests and benchmark
+        shell: bash
+        run: |
+          cat > benchmark.cjs <<'NODE'
+          const CryptoJS = require("crypto-js");
+          const { ShaAlgo } = require("./hashalgo_v1.1.js");
+
+          const algo = new ShaAlgo();
+
+          const algorithms = [
+            ["SHA-1", b => algo.sha1_160(b), CryptoJS.SHA1],
+            ["SHA-256", b => algo.sha2_256(b), CryptoJS.SHA256],
+            ["SHA-384", b => algo.sha2_384(b), CryptoJS.SHA384],
+            ["SHA-512", b => algo.sha2_512(b), CryptoJS.SHA512]
+          ];
+
+          function toWordArray(bytes) {
+            const words = [];
+            for (let i = 0; i < bytes.length; i += 4) {
+              words.push(
+                ((bytes[i] || 0) << 24) |
+                ((bytes[i + 1] || 0) << 16) |
+                ((bytes[i + 2] || 0) << 8) |
+                (bytes[i + 3] || 0)
+              );
+            }
+            return CryptoJS.lib.WordArray.create(words, bytes.length);
+          }
+
+          function hex(buffer) {
+            return Buffer.from(buffer).toString("hex");
+          }
+
+          function makeData(length, mode, seed = 123456789) {
+            const data = new Uint8Array(length);
+
+            if (mode === "zero") return data;
+
+            if (mode === "ff") {
+              data.fill(255);
+              return data;
+            }
+
+            if (mode === "sequence") {
+              for (let i = 0; i < length; i++) {
+                data[i] = i & 255;
+              }
+              return data;
+            }
+
+            let x = seed >>> 0;
+
+            for (let i = 0; i < length; i++) {
+              x ^= x << 13;
+              x ^= x >>> 17;
+              x ^= x << 5;
+              data[i] = x & 255;
+            }
+
+            return data;
+          }
+
+          const sizes = [
+            0, 1, 2, 3, 7, 8, 15, 16,
+            31, 32, 55, 56, 57, 63, 64, 65,
+            111, 112, 113, 119, 120, 121,
+            127, 128, 129, 191, 192, 193,
+            239, 240, 241, 255, 256, 257,
+            511, 512, 513, 1023, 1024, 1025,
+            4095, 4096, 4097, 16384, 65536
+          ];
+
+          const patterns = ["zero", "ff", "sequence", "random"];
+
+          let total = 0;
+          let failed = 0;
+
+          console.log("========================================");
+          console.log("HashAlgo v1.1 vs CryptoJS 4.2.0");
+          console.log("Node:", process.version);
+          console.log("Platform:", process.platform, process.arch);
+          console.log("========================================");
+
+          for (const [name, own, reference] of algorithms) {
+            console.log(`\n========== ${name} ==========`);
+
+            for (const size of sizes) {
+              for (const pattern of patterns) {
+                const data = makeData(size, pattern, size + 12345);
+
+                let actual;
+                let expected;
+
+                try {
+                  actual = hex(own(data));
+                  expected = reference(toWordArray(data)).toString();
+                } catch (error) {
+                  failed++;
+                  total++;
+
+                  console.error(
+                    `[ERROR] size=${size} pattern=${pattern}`,
+                    error.stack || error
+                  );
+
+                  continue;
+                }
+
+                total++;
+
+                if (actual !== expected) {
+                  failed++;
+
+                  console.error(
+                    `[FAIL] size=${size} pattern=${pattern}`
+                  );
+                  console.error("OWN:     ", actual);
+                  console.error("CryptoJS:", expected);
+                } else {
+                  console.log(
+                    `[PASS] size=${size} pattern=${pattern} digest=${actual.slice(0, 16)}...`
+                  );
+                }
+              }
+            }
+          }
+
+          console.log("\n========================================");
+          console.log(`Correctness: ${total - failed}/${total} PASS`);
+          console.log(`Failures: ${failed}`);
+          console.log("========================================");
+
+          if (failed !== 0) {
+            process.exit(1);
+          }
+
+          function median(values) {
+            const sorted = [...values].sort((a, b) => a - b);
+            return sorted[Math.floor(sorted.length / 2)];
+          }
+
+          function measure(fn, data, iterations) {
+            for (let i = 0; i < 3; i++) {
+              fn(data);
+            }
+
+            const results = [];
+
+            for (let r = 0; r < 5; r++) {
+              const start = process.hrtime.bigint();
+
+              for (let i = 0; i < iterations; i++) {
+                fn(data);
+              }
+
+              const end = process.hrtime.bigint();
+
+              results.push(Number(end - start) / 1e9);
+            }
+
+            return median(results);
+          }
+
+          const benchmarks = [
+            [64, 300],
+            [1024, 100],
+            [65536, 5],
+            [1048576, 1]
+          ];
+
+          console.log("\n\n========================================");
+          console.log("PERFORMANCE BENCHMARK");
+          console.log("Median of 5 measurements");
+          console.log("========================================");
+
+          for (const [name, own, reference] of algorithms) {
+            console.log(`\n========== ${name} ==========`);
+
+            for (const [size, iterations] of benchmarks) {
+              const data = makeData(size, "random");
+
+              const ownTime = measure(
+                own,
+                data,
+                iterations
+              );
+
+              const cryptoTime = measure(
+                b => reference(toWordArray(b)),
+                data,
+                iterations
+              );
+
+              console.log(
+                `Input: ${size} bytes`
+              );
+
+              console.log(
+                `Iterations: ${iterations}`
+              );
+
+              console.log(
+                `Own: ${ownTime.toFixed(6)} sec`
+              );
+
+              console.log(
+                `CryptoJS: ${cryptoTime.toFixed(6)} sec`
+              );
+
+              console.log(
+                `Own speed: ${(iterations / ownTime).toFixed(2)} hashes/sec`
+              );
+
+              console.log(
+                `CryptoJS speed: ${(iterations / cryptoTime).toFixed(2)} hashes/sec`
+              );
+
+              console.log(
+                `Ratio (Own/CryptoJS): ${(ownTime / cryptoTime).toFixed(3)}x`
+              );
+            }
+          }
+
+          console.log("\nBenchmark completed.");
+          NODE
+
+          node benchmark.cjs
